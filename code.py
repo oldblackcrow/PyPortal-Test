@@ -1,4 +1,3 @@
-# Import necessary libraries
 import time
 import sys
 import board
@@ -13,58 +12,62 @@ from adafruit_pyportal import PyPortal
 import adafruit_lidarlite
 import adafruit_ltr390
 from adafruit_button import Button
-import storage
-import adafruit_sdcard
 import json
 import adafruit_requests as requests
 import terminalio
+import gc
 try:
     from secrets import secrets
 except ImportError:
-    print("WiFi secrets are kept in secrets.py")
     raise
 
-cwd = ("/"+__file__).rsplit('/', 1)[0]  # Current working directory
+cwd = ("/" + __file__).rsplit('/', 1)[0]
 sys.path.append(cwd)
 
-# Let PyPortal initialize its own SPI bus and other resources
+# Define NOAA endpoints for solar wind data
+SOLAR_DATA_SOURCE = "https://services.swpc.noaa.gov/products/solar-wind/plasma-5-minute.json"
+SOLAR_MAG_DATA_SOURCE = "https://services.swpc.noaa.gov/products/solar-wind/mag-5-minute.json"
+
 pyportal = PyPortal()
 
-# Add this with your other global variables
-button_active = True  # Track if the connect button can be pressed
-last_connection_attempt = 0  # Track when we last tried to connect
-CONNECTION_COOLDOWN = 5  # Minimum seconds between connection attempts
+stardate_set = False
 
-# ------------- Pocket Geiger Setup ------------- #
-SIGNAL_PIN = board.D3  # Geiger Counter signal pin
-HISTORY_LENGTH = 60  # Store last 60 readings (1 min history)
-HISTORY_UNIT = 1  # seconds
-PROCESS_PERIOD = 0.160  # seconds
-K_ALPHA = 53.032  # Calibration constant
+# Global variables
+button_active = True
+last_connection_attempt = 0
+CONNECTION_COOLDOWN = 5
 
-# Radiation count variables
+# Calibration globals
+calibration_active = False
+calibration_group = None
+calibration_elements = {}
+
+# Pocket Geiger Setup
+SIGNAL_PIN = board.D3
+HISTORY_LENGTH = 60
+HISTORY_UNIT = 1  # seconds (adjustable)
+K_ALPHA = 53.032  # Calibration constant (adjustable)
+
 radiation_count = 0
 count_history = [0] * HISTORY_LENGTH
 history_index = 0
 history_length = 0
-last_process_time = time.monotonic()
 last_history_time = time.monotonic()
 
-#fonts
+# Fonts
 font_greek = bitmap_font.load_font("fonts/Greek03-Regular-25.bdf")
-font_trek = bitmap_font.load_font("fonts/LeagueSpartan-Bold-16.bdf")  # Rename to be clearer
+font_trek = bitmap_font.load_font("fonts/LeagueSpartan-Bold-16.bdf")
 
-last_button_flash = 0  # Initialize to 0 instead of time.monotonic()
+last_button_flash = 0
 BUTTON_FLASH_INTERVAL = 1.0
 
-# Set up digital input pin for Geiger counter
+# Setup digital input for Geiger counter
 try:
     signal_pin = digitalio.DigitalInOut(SIGNAL_PIN)
     signal_pin.direction = digitalio.Direction.INPUT
     signal_pin.pull = digitalio.Pull.UP
     geiger_found = True
 except Exception as e:
-    print(f"Geiger sensor not found: {e}")
     geiger_found = False
 
 # LIDAR setup
@@ -74,339 +77,215 @@ try:
     lidar = adafruit_lidarlite.LIDARLite(i2c)
     lidar_found = True
 except Exception as e:
-    print(f"LIDAR sensor not found: {e}")
     lidar_found = False
 
 # UV Sensor setup
 try:
     ltr = adafruit_ltr390.LTR390(i2c)
-    # Set integration time and gain to coax some life from the sensor.
-    ltr.integration_time = 200  # Increase integration time (in milliseconds, if supported)
-    ltr.gain = 1  # Adjust gain as needed
+    ltr.integration_time = 200
+    ltr.gain = 1
     uv_sensor_found = True
 except Exception as e:
-    print(f"UV sensor not found: {e}")
     uv_sensor_found = False
 
-# ------------- Network Connection ------------- #
+# Network Connection
 def try_connect_wifi():
-    print("\n=== WiFi Connection Attempt ===")
-    print("Time: 2025-03-05 15:12:30 UTC")
-    
     try:
-        # Check if already connected
         if pyportal.network._wifi.is_connected:
-            print("Already connected!")
             return True
-            
-        # Basic connection attempt
-        print(f"Attempting connection to: {secrets['ssid']}")
-        pyportal.network.connect()  # No timeout parameter
-        
-        # Monitor connection
+        print("Attempting to connect to WiFi...")
+        pyportal.network.connect()  # No timeout parameter supported
         start = time.monotonic()
-        dots = 0
-        while (time.monotonic() - start) < 20:  # 20 second monitoring window
-            try:
-                if pyportal.network._wifi.is_connected:
-                    print("\nConnection successful!")
-                    ip = pyportal.network._wifi.ip_address
-                    print(f"IP Address: {ip}")
-                    return True
-            except Exception:
-                pass
-            print("." if dots < 3 else "", end="")
-            dots = (dots + 1) % 4
-            time.sleep(1)
-        
-        print("\nConnection failed after 20 seconds")
-        print("\nSince this worked 3 days ago, try:")
-        print("1. Full reset sequence:")
-        print("   a) Turn off phone hotspot")
-        print("   b) Unplug PyPortal USB")
-        print("   c) On phone: forget saved networks")
-        print("   d) Wait 30 seconds")
-        print("   e) Plug in PyPortal")
-        print("   f) Wait for boot")
-        print("   g) Turn on phone hotspot")
-        print("   h) Wait 30 seconds")
-        print("   i) Try connecting")
-        return False
-        
+        timeout = 10  # seconds
+        while not pyportal.network._wifi.is_connected:
+            if time.monotonic() - start > timeout:
+                print("WiFi connection timed out.")
+                return False
+            time.sleep(0.5)
+        print("Connected")
+        return True
     except Exception as e:
-        print(f"\nError: {e}")
+        print("WiFi connection error:", e)
         return False
-# ------------- Display & Sound Setup ------------- #
+
+# Display & Sound Setup
 display = board.DISPLAY
+
+def update_time():
+    global stardate_set
+    try:
+        print("Fetching current time from worldtimeapi.org...")
+        time_str = pyportal.fetch("http://worldtimeapi.org/api/timezone/America/New_York")
+        time_json = json.loads(time_str)
+        dt = time_json["datetime"]
+        date_part, time_part = dt.split("T")
+        year, month, day = map(int, date_part.split("-"))
+        time_part = time_part.split(".")[0]
+        hour, minute, second = map(int, time_part.split(":"))
+        stardate_int = f"1{month:02d}{day:02d}"
+        stardate_decimal = f"{hour:02d}{minute:02d}"
+        stardate_label.text = f"STARDATE {stardate_int}.{stardate_decimal}"
+        stardate_set = True  # Mark that the stardate has been set.
+        print("Stardate updated:", stardate_label.text)
+    except Exception as e:
+        print("Error fetching time:", e)
 
 def calculate_stardate():
     now = time.localtime()
-    year = now[0]
-    day_of_year = now[7]
+    # Extract month and day (now[1] is month, now[2] is day)
+    month = now[1]
+    day = now[2]
+    # Format the first part as: 1 (for 21st century) followed by two-digit month and day.
+    stardate_int = f"1{month:02d}{day:02d}"
+    
+    # Extract hour and minute (now[3] is hour, now[4] is minute)
     hour = now[3]
-    stardate = (year - 2323) * 1000 + (day_of_year + hour/24)
-    return f"STARDATE {stardate:.1f}"
+    minute = now[4]
+    # Format the decimal portion as a 4-digit number: HHMM
+    stardate_decimal = f"{hour:02d}{minute:02d}"
+    
+    return f"STARDATE {stardate_int}.{stardate_decimal}"
 
-# Initialize touchscreen
 ts = adafruit_touchscreen.Touchscreen(
-    board.TOUCH_XL,
-    board.TOUCH_XR,
-    board.TOUCH_YD,
-    board.TOUCH_YU,
+    board.TOUCH_XL, board.TOUCH_XR, board.TOUCH_YD, board.TOUCH_YU,
     calibration=((5200, 59000), (5800, 57000)),
-    size=(display.width, display.height),
+    size=(display.width, display.height)
 )
 display.rotation = 0
 splash = displayio.Group()
-display.root_group = splash  # Set as active display group
+display.root_group = splash
 
-print("Display Test Passed!")
-
-# ------------- SD Card Logging Setup ------------- #
-sd_found = False
-log_file_path = ""
-try:
-    sd_cs = digitalio.DigitalInOut(board.SD_CS)  # Use board.SD_CS for chip select
-    # Use PyPortal's internal SPI bus (a sad, little private attribute)
-    sdcard = adafruit_sdcard.SDCard(pyportal._spi, sd_cs)
-    vfs = storage.VfsFat(sdcard)
-    storage.mount(vfs, "/sd")
-    sd_found = True
-    log_file_path = "/sd/data_log.csv"
-    # Create file header if it doesn't exist
-    try:
-        with open(log_file_path, "r") as f:
-            pass
-    except OSError:
-        with open(log_file_path, "w") as f:
-            f.write("timestamp,cpm,dose\n")
-    print("SD card logging enabled.")
-except Exception as e:
-    print("SD card not found or initialization error:", e)
-
-def log_data(cpm, dose):
-    """Append a new line with timestamp, CPM, and dose to the log file."""
-    if sd_found:
-        try:
-            with open(log_file_path, "a") as f:
-                f.write("{:.2f},{:.1f},{:.3f}\n".format(time.monotonic(), cpm, dose))
-        except Exception as e:
-            print("Error writing to SD card:", e)
-
-# ------------- TOS-Style UI ------------- #
-bg_rect = Rect(0, 0, 320, 240, fill=0x000000)  # Black background
+# TOS-Style UI Setup
+bg_rect = Rect(0, 0, 320, 240, fill=0x000000)
 splash.append(bg_rect)
 
-# **Side Panels vertical bar**
-left_panel = Rect(0, 0, 50, 200, fill=0x003366)
+left_panel = Rect(0, 0, 50, 200, fill=0x165FC5)
 splash.append(left_panel)
 
-# Create a gradient for the right side panel using a Bitmap and Palette
-panel_width = 10
-panel_height = 240  # Keep the full height
-color_steps = 64    # Use 64 colors instead of 240
+# Replace gradient right panel with a solid yellow vertical line (saves memory)
+right_panel = Rect(315, 1, 5, 200, fill=0xFDCD06)
+splash.append(right_panel)
 
-right_bitmap = displayio.Bitmap(panel_width, panel_height, color_steps)  # Use color_steps instead of panel_height
-right_palette = displayio.Palette(color_steps)  # Reduce palette to 64 colors
-
-for i in range(color_steps):
-    if i < color_steps // 2:
-        # Top half: interpolate from blue (0x003366) to yellow (255,255,0)
-        ratio = i / (color_steps // 2)
-        r = int(255 * ratio)               # from 0 to 255
-        g = int(51 * (1 - ratio) + 255 * ratio)  # from 51 to 255
-        b = int(102 * (1 - ratio))           # from 102 to 0
-    else:
-        # Bottom half: from yellow to red
-        ratio = (i - (color_steps // 2)) / (color_steps // 2)
-        r = 255                            # stays 255
-        g = int(255 * (1 - ratio))         # from 255 down to 0
-        b = 0                              # stays 0
-    color = (r << 16) | (g << 8) | b
-    right_palette[i] = color
-
-for x in range(panel_width):
-    for y in range(panel_height):
-        color_index = int((y * (color_steps - 1)) / (panel_height - 1))
-        right_bitmap[x, y] = color_index
-
-right_panel_tilegrid = displayio.TileGrid(right_bitmap, pixel_shader=right_palette, x=310, y=0)
-splash.append(right_panel_tilegrid)
-
-# Add horizontal bar at the top of the screen (same color as vertical bars)
-top_panel = Rect(0, 0, 320, 35, fill=0x003366)
+top_panel = Rect(0, 1, 320, 35, fill=0x165FC5)
 splash.append(top_panel)
 
-# **Blinking "SCANNING" Label**
-font_trek = bitmap_font.load_font("fonts/LeagueSpartan-Bold-16.bdf")
-scanning_label = Label(font=font_trek, text="SCANNING", color=0xFFFF00, scale=1)
-scanning_label.x = 180
-scanning_label.y = 50
-splash.append(scanning_label)
-
-# **Tab Buttons**
 buttons = []
-
-#Stardate Label
-stardate_label = Label(
-    font=terminalio.FONT,
-    text="STARDATE 41234.5",
-    color=0x00FFFF,
-    scale=1  # We can safely use scale=2 with terminalio.FONT since it's quite small
-)
-stardate_label.x = 210
+stardate_label = Label(font=terminalio.FONT, text="STARDATE 41234.5", color=0xFFFFFF, scale=1)
+stardate_label.x = 200
 stardate_label.y = 15
 splash.append(stardate_label)
 
-# Adjusted x positions to fit four buttons
+# Tab Buttons (using Adafruit Button for main UI)
 button_radiation = Button(x=15, y=200, width=70, height=30,
-                         label="γ", label_font=font_greek, fill_color=0xFFFFFF)
+                          label="γ", label_font=font_greek, fill_color=0xB9C92F)
 button_distance = Button(x=90, y=200, width=70, height=30,
-                        label="Prox", label_font=font_trek, fill_color=0xFFFFFF)
+                         label="Prox", label_font=font_trek, fill_color=0xBF0F0F)
 button_uv = Button(x=163, y=200, width=70, height=30,
-                   label="Δ", label_font=font_greek, fill_color=0xFFFFFF)
-button_ship = Button(x=236, y=200, width=70, height=30,
-                    label="Ship", label_font=font_trek, fill_color=0x800000)
+                   label="Δ", label_font=font_greek, fill_color=0xBF0F0F)
+button_probes = Button(x=236, y=200, width=70, height=30,
+                       label="Probes", label_font=font_trek, fill_color=0xBF0F0F)
+buttons.extend([button_radiation, button_distance, button_uv, button_probes])
+for b in buttons:
+    splash.append(b)
 
-button_radiation.fill_color = 0x00FF00  # Active
-button_distance.fill_color = 0x800000   # Inactive
-button_uv.fill_color = 0x800000        # Inactive
-button_ship.fill_color = 0x800000      # Inactive
-
-buttons.append(button_radiation)
-buttons.append(button_distance)
-buttons.append(button_uv)
-buttons.append(button_ship)
-splash.append(button_radiation)
-splash.append(button_distance)
-splash.append(button_uv)
-splash.append(button_ship)
-
-# ------------- UI Containers (Only This Switches) ------------- #
 content_group = displayio.Group()
 splash.append(content_group)
 
-# ------------- Radiation Tab UI ------------- #
+# Radiation Tab UI
 view_radiation = displayio.Group()
 radiation_label = Label(font=font_trek, text="CPM: --", color=0x00FFFF, scale=1)
 radiation_label.x = 70
 radiation_label.y = 80
 view_radiation.append(radiation_label)
-
 dose_label = Label(font=font_trek, text="DOSE: -- µSv/h", color=0xFFFF00, scale=1)
 dose_label.x = 70
 dose_label.y = 115
 view_radiation.append(dose_label)
-
-# Add a sensor warning label for the "Sensor not found" message
 sensor_warning_label = Label(font=font_trek, text="", color=0xFF0000, scale=1)
 sensor_warning_label.x = 70
-sensor_warning_label.y = 145  # Adjust the y-coordinate as needed
+sensor_warning_label.y = 145
 view_radiation.append(sensor_warning_label)
+button_cal = Button(x=5, y=85, width=40, height=30,
+                    label="C", label_font=font_trek, fill_color=0xBF0F0F)
+view_radiation.append(button_cal)
 
-# ------------- Distance Tab UI (Prox) ------------- #
+# Distance Tab UI
 view_distance = displayio.Group()
 distance_label = Label(font=font_trek, text="Distance: -- m", color=0x00FFFF, scale=1)
 distance_label.x = 70
 distance_label.y = 80
 view_distance.append(distance_label)
-
-no_data_label = Label(font=font_trek, text="Sensor not detected.", color=0xFF0000, scale=1)
+no_data_label = Label(font=font_trek, text="Sensor offline", color=0xFF0000, scale=1)
 no_data_label.x = 70
 no_data_label.y = 130
 view_distance.append(no_data_label)
 
-# ------------- UV Sensor Tab UI (Δ) ------------- #
+# UV Sensor Tab UI
 view_uv = displayio.Group()
 uv_index_label = Label(font=font_trek, text="UV Index: --", color=0x00FFFF, scale=1)
 uv_index_label.x = 70
 uv_index_label.y = 80
 view_uv.append(uv_index_label)
-
 uv_intensity_label = Label(font=font_trek, text="UV I: --", color=0xFFFF00, scale=1)
 uv_intensity_label.x = 70
 uv_intensity_label.y = 115
 view_uv.append(uv_intensity_label)
-
-no_uv_label = Label(font=font_trek, text="No sensor detected.", color=0xFF0000, scale=1)
+no_uv_label = Label(font=font_trek, text="Sensor offline", color=0xFF0000, scale=1)
 no_uv_label.x = 70
 no_uv_label.y = 150
 view_uv.append(no_uv_label)
 
-# ------------- Ship Tab UI ------------- #
-view_ship = displayio.Group()
-
-# Network status labels
-ship_status_label = Label(font=font_trek, text="Network Status:", color=0x00FFFF)
-ship_status_label.x = 70
-ship_status_label.y = 80
-view_ship.append(ship_status_label)
-
-ship_connection_label = Label(font=font_trek, text="Not Connected", color=0xFF0000)
-ship_connection_label.x = 70
-ship_connection_label.y = 100
-view_ship.append(ship_connection_label)
-
-solar_frame = Rect(52, 45, 225, 150, fill=0x000022, outline=0x00FFFF)
-view_ship.append(solar_frame)
-
-solar_header = Label(font=font_trek, text="SOLAR WEATHER", color=0x00FFFF)
-solar_header.x = 10
-solar_header.y = 15  # Centered in the 35px high top bar
-view_ship.append(solar_header)
-
+# Probes Tab UI
+view_probes = displayio.Group()
+probes_status_label = Label(font=font_trek, text="Network Status:", color=0x00FFFF)
+probes_status_label.x = 70
+probes_status_label.y = 80
+view_probes.append(probes_status_label)
+probes_connection_label = Label(font=font_trek, text="Not Connected", color=0xFF0000)
+probes_connection_label.x = 70
+probes_connection_label.y = 100
+view_probes.append(probes_connection_label)
+solar_frame = Rect(52, 45, 225, 150, fill=0x000022)
+view_probes.append(solar_frame)
+solar_header = Label(font=terminalio.FONT, text="SOLAR WEATHER", color=0x00FFFF, scale=2)
+solar_header.x = 20
+solar_header.y = 20
+view_probes.append(solar_header)
 wind_speed = Label(font=terminalio.FONT, text="SPEED: - km/s", color=0x00FF00, scale=2)
 wind_speed.x = 60
 wind_speed.y = 70
-view_ship.append(wind_speed)
-
+view_probes.append(wind_speed)
 wind_density = Label(font=terminalio.FONT, text="DENSITY: - p/cm³", color=0x00FF00, scale=2)
 wind_density.x = 60
 wind_density.y = 100
-view_ship.append(wind_density)
-
+view_probes.append(wind_density)
 mag_field = Label(font=terminalio.FONT, text="MAG FIELD: - nT", color=0x00FF00, scale=2)
 mag_field.x = 60
 mag_field.y = 130
-view_ship.append(mag_field)
-
+view_probes.append(mag_field)
 status_label = Label(font=terminalio.FONT, text="", color=0xFFFF00)
 status_label.x = 60
 status_label.y = 165
-view_ship.append(status_label)
+view_probes.append(status_label)
+connect_button = Button(x=165, y=160, width=90, height=30,
+                        label="CONNECT", label_font=terminalio.FONT,
+                        label_color=0xFDCD06, fill_color=0x11709F)
+view_probes.append(connect_button)
 
-# Add connect button
-connect_button = Button(
-    x=180,
-    y=160,
-    width=90,
-    height=30,
-    label="Connect to WiFi",
-    label_font=terminalio.FONT,
-    label_color=0x00FF00,
-    fill_color=0x222222
-)
-view_ship.append(connect_button)
-
-# ------------- Radiation Processing ------------- #
+# Radiation Processing
 def process_radiation():
-    global last_process_time, last_history_time, radiation_count, history_index, history_length
-
+    global last_history_time, radiation_count, history_index, history_length
     current_time = time.monotonic()
-
     if geiger_found and not signal_pin.value:
         radiation_count += 1
-
     if current_time - last_history_time >= HISTORY_UNIT:
         last_history_time = current_time
         count_history[history_index] = radiation_count
         radiation_count = 0
         history_index = (history_index + 1) % HISTORY_LENGTH
         history_length = min(history_length + 1, HISTORY_LENGTH)
-        # Log data after updating history
-        cpm = calculate_cpm()
-        dose = calculate_uSvh()
-        log_data(cpm, dose)
+        cpm = (sum(count_history) * 60) / (history_length * HISTORY_UNIT) if history_length else 0
+        dose = cpm / K_ALPHA if geiger_found else 0
 
 def calculate_cpm():
     return (sum(count_history) * 60) / (history_length * HISTORY_UNIT) if history_length else 0
@@ -414,251 +293,313 @@ def calculate_cpm():
 def calculate_uSvh():
     return calculate_cpm() / K_ALPHA if geiger_found else 0
 
+# Custom Calibration Button Helpers
+def create_calibration_button(x, y, width, height, text, fill_color=0xBF0F0F, text_color=0xFFFFFF, scale=1):
+    grp = displayio.Group()
+    rect = Rect(x, y, width, height, fill=fill_color)
+    grp.append(rect)
+    label = Label(font=terminalio.FONT, text=text, color=text_color, scale=scale)
+    label.x = x + 3
+    label.y = y + 3
+    grp.append(label)
+    return {"group": grp, "x": x, "y": y, "width": width, "height": height, "label": label}
+
+def in_button(touch, button):
+    x, y = touch
+    bx = button["x"]
+    by = button["y"]
+    bw = button["width"]
+    bh = button["height"]
+    return (bx <= x <= bx + bw) and (by <= y <= by + bh)
+
+# Calibration Window Functions using custom buttons
+def show_calibration_window():
+    global calibration_active, calibration_group, calibration_elements
+    if content_group in splash:
+        splash.remove(content_group)
+    calibration_active = True
+    calibration_group = displayio.Group()
+
+    # Layout updated for easier tapping:
+    title_label = Label(font=terminalio.FONT, text="Calibration", color=0x00FFFF, scale=2)
+    title_label.x = 50
+    title_label.y = 20
+    calibration_group.append(title_label)
+
+    label_k = Label(font=terminalio.FONT, text="K: {:.3f}".format(K_ALPHA), color=0xFFFFFF, scale=2)
+    label_k.x = 60
+    label_k.y = 50
+    calibration_group.append(label_k)
+
+    button_k_minus = create_calibration_button(70, 65, 30, 20, "-", fill_color=0xBF0F0F, text_color=0xFFFFFF, scale=2)
+    button_k_plus  = create_calibration_button(140, 65, 30, 20, "+", fill_color=0xB9C92F, text_color=0x11709F, scale=2)
+    calibration_group.append(button_k_minus["group"])
+    calibration_group.append(button_k_plus["group"])
+    button_k_minus["label"].x = button_k_minus["x"] + 10  # New horizontal offset for K -
+    button_k_minus["label"].y = button_k_minus["y"] + 9   # New vertical offset for K -
+    button_k_plus["label"].x  = button_k_plus["x"]  + 10   # New horizontal offset for K +
+    button_k_plus["label"].y  = button_k_plus["y"]  + 9    # New vertical offset for K +
+
+    label_t = Label(font=terminalio.FONT, text="Time: {}".format(HISTORY_UNIT), color=0xFFFFFF, scale=2)
+    label_t.x = 60
+    label_t.y = 105
+    calibration_group.append(label_t)
+
+    button_t_minus = create_calibration_button(70, 120, 30, 20, "-", fill_color=0xBF0F0F, text_color=0xFFFFFF, scale=2)
+    button_t_plus  = create_calibration_button(140, 120, 30, 20, "+", fill_color=0xB9C92F, text_color=0x11709F, scale=2)
+    calibration_group.append(button_t_minus["group"])
+    calibration_group.append(button_t_plus["group"])
+    button_t_minus["label"].x = button_t_minus["x"] + 10  # New horizontal offset
+    button_t_minus["label"].y = button_t_minus["y"] + 9  # New vertical offset
+    button_t_plus["label"].x = button_t_plus["x"] + 10    # New horizontal offset
+    button_t_plus["label"].y = button_t_plus["y"] + 9    # New vertical offset
+
+    button_done = create_calibration_button(140, 160, 70, 30, "DONE", fill_color=0x11709F, scale=2)
+    calibration_group.append(button_done["group"])
+    button_done["label"].x = button_done["x"] + 15  # New horizontal offset
+    button_done["label"].y = button_done["y"] + 15  # New vertical offset
+
+    calibration_elements = {
+        "label_k": label_k,
+        "button_k_minus": button_k_minus,
+        "button_k_plus": button_k_plus,
+        "label_t": label_t,
+        "button_t_minus": button_t_minus,
+        "button_t_plus": button_t_plus,
+        "button_done": button_done
+    }
+
+    splash.append(calibration_group)
+
+def hide_calibration_window():
+    global calibration_active, calibration_group
+    if calibration_group is not None:
+        splash.remove(calibration_group)
+    calibration_group = None
+    calibration_active = False
+    splash.append(content_group)
+
+def calibrate_pocketgeiger():
+    show_calibration_window()
+
+# Update Display Function
 def update_display():
-    global last_button_flash  # Must be at start of function
-    current_time = time.monotonic()  # Move this here so it's available for all views
-    stardate_label.text = calculate_stardate()
-    # For Radiation and UV views, update the scanning label to blink when the sensor is active.
+    current_time = time.monotonic()
+    global stardate_set
+    if not stardate_set:
+        stardate_label.text = calculate_stardate()
     if view_live == "Radiation":
         if sum(count_history) == 0:
             radiation_label.text = "CPM: --"
             dose_label.text = "DOSE: -- µSv/h"
-            sensor_warning_label.text = "Sensor not found"
-            scanning_label.text = ""
+            sensor_warning_label.text = "Sensor offline"
         else:
             radiation_label.text = f"CPM: {calculate_cpm():.1f}"
             dose_label.text = f"DOSE: {calculate_uSvh():.3f} µSv/h"
             sensor_warning_label.text = ""
-            scanning_label.text = "SCANNING"
-            scanning_label.color = 0xFFFF00 if int(time.monotonic() % 2) == 0 else 0x000000
     elif view_live == "Distance":
         if lidar_found:
-            distance = lidar.distance  # assume in cm, converting to m
+            distance = lidar.distance
             distance_label.text = f"Distance: {distance/100:.2f} m"
             no_data_label.text = ""
         else:
             distance_label.text = "Distance: -- m"
-            no_data_label.text = "Sensor not detected."
-        scanning_label.text = ""  # No scanning on distance view.
+            no_data_label.text = "Sensor offline"
     elif view_live == "UV":
         if uv_sensor_found:
             uv_index_label.text = f"UV Index: {ltr.uvi:.2f}"
             uv_intensity_label.text = f"UV I: {ltr.lux:.2f}"
             no_uv_label.text = ""
-            scanning_label.text = "SCANNING"
-            scanning_label.color = 0xFFFF00 if int(time.monotonic() % 2) == 0 else 0x000000
         else:
             uv_index_label.text = "UV Index: --"
             uv_intensity_label.text = "UV I: --"
-            no_uv_label.text = "No sensor detected."
-            scanning_label.text = ""
-    elif view_live == "Ship":
-        scanning_label.text = ""
+            no_uv_label.text = "Sensor offline"
+    elif view_live == "Probes":
         try:
-            wifi_status = pyportal.network._wifi.is_connected
-            if wifi_status:
-                ship_connection_label.text = "Connected"
-                ship_connection_label.color = 0x00FF00  # Green
-                connect_button.label = "Reconnect"
-                connect_button.fill_color = 0x222222  # Normal color
+            if pyportal.network._wifi.is_connected:
+                probes_connection_label.text = "Connected"
+                probes_connection_label.color = 0x00FF00
+                # Do not update connect_button.label here; it's updated in the touch handler.
+                connect_button.fill_color = 0x11709F
             else:
-                ship_connection_label.text = "Not Connected"
-                ship_connection_label.color = 0xFF0000  # Red
-                
-                # Only flash if button is active
-                if button_active:
-                    if current_time - last_button_flash >= BUTTON_FLASH_INTERVAL:
-                        if connect_button.label == "Connecting...":
-                            connect_button.label = "Connect to WiFi"
-                        connect_button.label = "" if connect_button.label == "Connect to WiFi" else "Connect to WiFi"
-                        last_button_flash = current_time
-                else:
-                    # If button is not active, keep "Connecting..." visible
-                    connect_button.label = "Connecting..."
-                    connect_button.fill_color = 0x404040  # Darker color
-                    
+                probes_connection_label.text = "Not Connected"
+                probes_connection_label.color = 0xFF0000
+                # Leave connect_button.label unchanged here.
+                connect_button.fill_color = 0x11709F
         except Exception as e:
-            print(f"Network status check error: {e}")
-            ship_connection_label.text = "Status Unknown"
-            ship_connection_label.color = 0xFF0000  # Red
-            connect_button.fill_color = 0x222222  # Normal color
+            probes_connection_label.text = "Status Unknown"
+            probes_connection_label.color = 0xFF0000
+            connect_button.fill_color = 0x11709F
+
 def switch_view(new_view):
     global view_live
     pyportal.play_file("/sounds/tab.wav")
     if content_group:
         content_group.pop()
-    
-    # Safely remove delta logo from any previous view
-    try:
-        view_radiation.remove(delta_logo)
-    except:
-        pass
-    try:
-        view_distance.remove(delta_logo)
-    except:
-        pass
-    try:
-        view_uv.remove(delta_logo)
-    except:
-        pass
-    try:
-        view_ship.remove(delta_logo)
-    except:
-        pass
-        
+    for view in (view_radiation, view_distance, view_uv, view_probes):
+        try:
+            view.remove(delta_logo)
+        except Exception:
+            pass
     view_live = new_view
     if new_view == "Radiation":
         content_group.append(view_radiation)
         view_radiation.append(delta_logo)
-        button_radiation.fill_color = 0x00FF00
-        button_distance.fill_color = 0x800000
-        button_uv.fill_color = 0x800000
-        button_ship.fill_color = 0x800000
+        button_radiation.fill_color = 0xB9C92F
+        button_distance.fill_color = 0xBF0F0F
+        button_uv.fill_color = 0xBF0F0F
+        button_probes.fill_color = 0xBF0F0F
     elif new_view == "Distance":
         content_group.append(view_distance)
         view_distance.append(delta_logo)
-        button_radiation.fill_color = 0x800000
-        button_distance.fill_color = 0x00FF00
-        button_uv.fill_color = 0x800000
-        button_ship.fill_color = 0x800000
+        button_radiation.fill_color = 0xBF0F0F
+        button_distance.fill_color = 0xB9C92F
+        button_uv.fill_color = 0xBF0F0F
+        button_probes.fill_color = 0xBF0F0F
     elif new_view == "UV":
         content_group.append(view_uv)
         view_uv.append(delta_logo)
-        button_radiation.fill_color = 0x800000
-        button_distance.fill_color = 0x800000
-        button_uv.fill_color = 0x00FF00
-        button_ship.fill_color = 0x800000
-    elif new_view == "Ship":
-        content_group.append(view_ship)
-        view_ship.append(delta_logo)
-        button_radiation.fill_color = 0x800000
-        button_distance.fill_color = 0x800000
-        button_uv.fill_color = 0x800000
-        button_ship.fill_color = 0x00FF00
-
+        button_radiation.fill_color = 0xBF0F0F
+        button_distance.fill_color = 0xBF0F0F
+        button_uv.fill_color = 0xB9C92F
+        button_probes.fill_color = 0xBF0F0F
+    elif new_view == "Probes":
+        content_group.append(view_probes)
+        view_probes.append(delta_logo)
+        button_radiation.fill_color = 0xBF0F0F
+        button_distance.fill_color = 0xBF0F0F
+        button_uv.fill_color = 0xBF0F0F
+        button_probes.fill_color = 0xB9C92F
     update_display()
 
 def check_network_status():
-    """Check if PyPortal has network connectivity"""
     try:
         return pyportal.network.check_connectivity()
     except Exception as e:
-        print(f"Network check error: {e}")
         return False
 
-
-# ------------- Load and display the Star Trek delta logo AFTER defining all views ------------- #
 try:
-    print("Attempting to load delta.bmp...")
     delta_bitmap = displayio.OnDiskBitmap("/delta.bmp")
-
-    # Create one instance
     delta_logo = displayio.TileGrid(delta_bitmap, pixel_shader=delta_bitmap.pixel_shader)
     delta_logo.x = 272
     delta_logo.y = 140
-
-    print("✅ Delta logo loaded successfully!")
-    print(f"Bitmap size: {delta_bitmap.width}x{delta_bitmap.height}")
-
-    # Add to initial view
-    view_radiation.append(delta_logo)  # Since "Radiation" is our default view
-
-    print("✅ Delta logo added to initial screen!")
-
+    view_radiation.append(delta_logo)
 except Exception as e:
-    print(f"❌ Failed to load delta.bmp: {e}")
+    pass
 
 def update_solar_wind():
     try:
-        # NOAA's space weather API endpoint
-        url = "https://services.swpc.noaa.gov/products/solar-wind/plasma-1-day.json"
-        response = requests.get(url)
-        data = response.json()
+        print("Fetching plasma data from NOAA 5-minute endpoint...")
+        plasma_str = pyportal.fetch(SOLAR_DATA_SOURCE)
+        # If the fetched data is a string, parse it into a Python object:
+        if isinstance(plasma_str, str):
+            plasma_data = json.loads(plasma_str)
+        else:
+            plasma_data = plasma_str
+        print("Plasma data received:", plasma_data)
+        print("Type of plasma_data:", type(plasma_data), "Length:", len(plasma_data))
+        if len(plasma_data) < 2:
+            raise Exception("Plasma data too short")
+        latest = plasma_data[-1]
+        wind_density.text = f"DENSITY: {float(latest[1]):.1f} p/cm³"
+        wind_speed.text = f"SPEED: {float(latest[2]):.1f} km/s"
 
-        # Get the most recent measurement (last item in the array)
-        latest = data[-1]
-
-        # Update display labels
-        wind_speed.text = f"SPEED: {float(latest[1]):.1f} km/s"
-        wind_density.text = f"DENSITY: {float(latest[2]):.1f} p/cm³"
-
-        # Get magnetic field data from separate endpoint
-        mag_url = "https://services.swpc.noaa.gov/products/solar-wind/mag-1-day.json"
-        mag_response = requests.get(mag_url)
-        mag_data = mag_response.json()
+        print("Fetching magnetic field data from NOAA 5-minute endpoint...")
+        mag_str = pyportal.fetch(SOLAR_MAG_DATA_SOURCE)
+        if isinstance(mag_str, str):
+            mag_data = json.loads(mag_str)
+        else:
+            mag_data = mag_str
+        print("Magnetic field data received:", mag_data)
+        if len(mag_data) < 2:
+            raise Exception("Mag data too short")
         latest_mag = mag_data[-1]
-
-        mag_field.text = f"MAG FIELD: {float(latest_mag[6]):.1f} nT"
-
-        # Update status based on solar wind speed
-        speed = float(latest[1])
+        if len(latest_mag) < 5:
+            raise Exception("Mag data row too short")
+        mag_field.text = f"MAG FIELD: {float(latest_mag[4]):.1f} nT"
+        
+        speed = float(latest[2])
         if speed > 800:
             status_label.text = "WARNING: SOLAR STORM"
-            status_label.color = 0xFF0000  # Red
+            status_label.color = 0xFF0000
         elif speed > 500:
             status_label.text = "ELEVATED ACTIVITY"
-            status_label.color = 0xFFFF00  # Yellow
+            status_label.color = 0xFFFF00
         else:
             status_label.text = "NOMINAL"
-            status_label.color = 0x00FF00  # Green
+            status_label.color = 0x00FF00
 
+        print("update_solar_wind() complete.")
     except Exception as e:
-        print(f"Solar wind update error: {e}")
         status_label.text = "DATA UNAVAILABLE"
         status_label.color = 0xFF0000
+        print("Error in update_solar_wind:", e)
 
 last_solar_update = time.monotonic()
-SOLAR_UPDATE_INTERVAL = 300  # Update every 5 minutes
+gc.collect()
+SOLAR_UPDATE_INTERVAL = 45
 
-# ------------- Main Loop ------------- #
 view_live = "Radiation"
 content_group.append(view_radiation)
 
 while True:
+    if calibration_active:
+        touch = ts.touch_point
+        if touch:
+            if in_button((touch[0], touch[1]), calibration_elements["button_k_minus"]):
+                K_ALPHA -= 0.1
+                calibration_elements["label_k"].text = "K: {:.3f}".format(K_ALPHA)
+                time.sleep(0.3)
+            elif in_button((touch[0], touch[1]), calibration_elements["button_k_plus"]):
+                K_ALPHA += 0.1
+                calibration_elements["label_k"].text = "K: {:.3f}".format(K_ALPHA)
+                time.sleep(0.3)
+            elif in_button((touch[0], touch[1]), calibration_elements["button_t_minus"]):
+                if HISTORY_UNIT > 0.5:
+                    HISTORY_UNIT -= 0.5
+                calibration_elements["label_t"].text = "Time: {}s".format(HISTORY_UNIT)
+                time.sleep(0.3)
+            elif in_button((touch[0], touch[1]), calibration_elements["button_t_plus"]):
+                HISTORY_UNIT += 0.5
+                calibration_elements["label_t"].text = "Time: {}s".format(HISTORY_UNIT)
+                time.sleep(0.3)
+            elif in_button((touch[0], touch[1]), calibration_elements["button_done"]):
+                hide_calibration_window()
+                time.sleep(0.3)
+        continue
+
     touch = ts.touch_point
     if touch:
-        # Handle tab buttons
         for i, button in enumerate(buttons):
             if button.contains(touch):
-                switch_view(["Radiation", "Distance", "UV", "Ship"][i])
+                switch_view(["Radiation", "Distance", "UV", "Probes"][i])
                 break
+        if view_live == "Radiation" and button_cal.contains(touch):
+            calibrate_pocketgeiger()
+            time.sleep(0.3)
+    if view_live == "Probes" and connect_button.contains(touch):
+        current_time = time.monotonic()
+        if button_active and (current_time - last_connection_attempt) >= CONNECTION_COOLDOWN:
+            last_connection_attempt = current_time
+            button_active = False
+            connect_button.label = "Connecting..."
+            connect_button.fill_color = 0x11709F
+            success = try_connect_wifi()
+            if success:
+                # Immediately update time and solar data upon connection:
+                update_time()
+                update_solar_wind()
+                last_solar_update = time.monotonic()
+            button_active = True
+            connect_button.fill_color = 0x11709F
+            connect_button.label = "Reconnect" if success else "CONNECT"
 
-        # Handle Ship tab connect button
-        if view_live == "Ship" and connect_button.contains(touch):
-            current_time = time.monotonic()
-            # Only allow new connection attempts after cooldown
-            if button_active and (current_time - last_connection_attempt) >= CONNECTION_COOLDOWN:
-                print("\n=== Button Press Debug ===")
-                print("Connect button pressed at:", current_time)
-                
-                # Store attempt time and disable button temporarily
-                last_connection_attempt = current_time
-                button_active = False
-                connect_button.label = "Connecting..."
-                connect_button.fill_color = 0x404040  # Darker color while connecting
-                
-                # Update display once to show "Connecting..."
-                update_display()
-                
-                # Attempt connection
-                success = try_connect_wifi()
-                
-                # Reset button state
-                button_active = True
-                connect_button.fill_color = 0x222222  # Restore original color
-                connect_button.label = "Reconnect" if success else "Connect to WiFi"
-                
-                print("=== End Button Press ===\n")
-                
     process_radiation()
     update_display()
-
-# Update solar wind data periodically
     current_time = time.monotonic()
     if current_time - last_solar_update >= SOLAR_UPDATE_INTERVAL:
-        if view_live == "Ship" and pyportal.network._wifi.is_connected:
-            # Add a small delay to ensure connection is stable
+        if view_live == "Probes" and pyportal.network._wifi.is_connected:
             time.sleep(0.5)
-            if pyportal.network._wifi.is_connected:  # Double-check connection
+            if pyportal.network._wifi.is_connected:
                 update_solar_wind()
                 last_solar_update = current_time
