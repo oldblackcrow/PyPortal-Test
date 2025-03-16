@@ -93,19 +93,19 @@ def try_connect_wifi():
     try:
         if pyportal.network._wifi.is_connected:
             return True
-        print("Attempting to connect to WiFi...")
+        print("Attempt Subspace connection")
         pyportal.network.connect()  # No timeout parameter supported
         start = time.monotonic()
         timeout = 10  # seconds
         while not pyportal.network._wifi.is_connected:
             if time.monotonic() - start > timeout:
-                print("WiFi connection timed out.")
+                print("Subspace connection timed out.")
                 return False
             time.sleep(0.5)
         print("Connected")
         return True
     except Exception as e:
-        print("WiFi connection error:", e)
+        print("Subspace connection error:", e)
         return False
 
 # Display & Sound Setup
@@ -114,7 +114,7 @@ display = board.DISPLAY
 def update_time():
     global stardate_set
     try:
-        print("Fetching current time from worldtimeapi.org...")
+        print("Fetching current time...")
         time_str = pyportal.fetch("http://worldtimeapi.org/api/timezone/America/New_York")
         time_json = json.loads(time_str)
         dt = time_json["datetime"]
@@ -137,13 +137,13 @@ def calculate_stardate():
     day = now[2]
     # Format the first part as: 1 (for 21st century) followed by two-digit month and day.
     stardate_int = f"1{month:02d}{day:02d}"
-    
+
     # Extract hour and minute (now[3] is hour, now[4] is minute)
     hour = now[3]
     minute = now[4]
     # Format the decimal portion as a 4-digit number: HHMM
     stardate_decimal = f"{hour:02d}{minute:02d}"
-    
+
     return f"STARDATE {stardate_int}.{stardate_decimal}"
 
 ts = adafruit_touchscreen.Touchscreen(
@@ -489,7 +489,7 @@ except Exception as e:
 
 def update_solar_wind():
     try:
-        print("Fetching plasma data from NOAA 5-minute endpoint...")
+        print("Fetching plasma data...")
         plasma_str = pyportal.fetch(SOLAR_DATA_SOURCE)
         # If the fetched data is a string, parse it into a Python object:
         if isinstance(plasma_str, str):
@@ -504,7 +504,7 @@ def update_solar_wind():
         wind_density.text = f"DENSITY: {float(latest[1]):.1f} p/cm³"
         wind_speed.text = f"SPEED: {float(latest[2]):.1f} km/s"
 
-        print("Fetching magnetic field data from NOAA 5-minute endpoint...")
+        print("Fetching magnetic field data ...")
         mag_str = pyportal.fetch(SOLAR_MAG_DATA_SOURCE)
         if isinstance(mag_str, str):
             mag_data = json.loads(mag_str)
@@ -517,7 +517,7 @@ def update_solar_wind():
         if len(latest_mag) < 5:
             raise Exception("Mag data row too short")
         mag_field.text = f"MAG FIELD: {float(latest_mag[4]):.1f} nT"
-        
+
         speed = float(latest[2])
         if speed > 800:
             status_label.text = "WARNING: SOLAR STORM"
