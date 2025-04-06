@@ -155,14 +155,14 @@ display.rotation = 0
 splash = displayio.Group()
 display.root_group = splash
 
-# TOS-Style UI Setup
+# UI Setup
 bg_rect = Rect(0, 0, 320, 240, fill=0x000000)
 splash.append(bg_rect)
 
 left_panel = Rect(0, 0, 50, 200, fill=0x165FC5)
 splash.append(left_panel)
 
-# Replace gradient right panel with a solid yellow vertical line (saves memory)
+# Solid yellow vertical line
 right_panel = Rect(315, 1, 5, 200, fill=0xFDCD06)
 splash.append(right_panel)
 
@@ -320,7 +320,7 @@ def show_calibration_window():
     calibration_active = True
     calibration_group = displayio.Group()
 
-    # Layout updated for easier tapping:
+    # Calibration Layout
     title_label = Label(font=terminalio.FONT, text="Calibration", color=0x00FFFF, scale=2)
     title_label.x = 50
     title_label.y = 20
