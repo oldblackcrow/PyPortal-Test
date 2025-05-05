@@ -9,7 +9,6 @@ from adafruit_display_text.label import Label
 from adafruit_display_shapes.rect import Rect
 import adafruit_touchscreen
 from adafruit_pyportal import PyPortal
-import adafruit_lidarlite
 import adafruit_ltr390
 from adafruit_button import Button
 import json
@@ -44,7 +43,7 @@ calibration_elements = {}
 # Pocket Geiger Setup
 SIGNAL_PIN = board.D3
 HISTORY_LENGTH = 60
-HISTORY_UNIT = 1  # seconds (adjustable)
+HISTORY_UNIT = 60  # seconds (adjustable)
 K_ALPHA = 53.032  # Calibration constant
 
 radiation_count = 0
@@ -69,18 +68,9 @@ try:
 except Exception:
     geiger_found = False
 
-# LIDAR setup Make sure to use the adafruit_lidarlite.PY file instead of the adafruit_lidarlite.MPY
-lidar_found = False
-try:
-    i2c = busio.I2C(board.SCL, board.SDA)
-    # Use the V4‑LED driver class for your V4 module
-    lidar = adafruit_lidarlite.LIDARLiteV4LED(i2c)
-    lidar_found = True
-except Exception:
-    lidar_found = False
-
 # UV Sensor setup
 try:
+    i2c = busio.I2C(board.SCL, board.SDA)
     ltr = adafruit_ltr390.LTR390(i2c)
     ltr.integration_time = 200
     ltr.gain = 1
@@ -118,29 +108,23 @@ splash.append(bg_rect)
 normal_ui = displayio.Group()
 splash.append(normal_ui)
 
-# Add UI elements into normal_ui
-
 # Panels and Top Bar
-left_panel = Rect(0, 0, 50, 200, fill=0x165FC5)
+left_panel = Rect(0, 0, 50, 240, fill=0x165FC5)
 normal_ui.append(left_panel)
-right_panel = Rect(315, 1, 5, 200, fill=0xFDCD06)
+right_panel = Rect(315, 1, 10, 240, fill=0xFDCD06)
 normal_ui.append(right_panel)
 top_panel = Rect(0, 1, 320, 35, fill=0x165FC5)
 normal_ui.append(top_panel)
 
-# (Stardate components removed)
-
-# Tab Buttons (Radiation, Proximity, UV, Probes)
+# Tab Buttons (Radiation, UV, Probes)
 buttons = []
-button_radiation = Button(x=15, y=200, width=70, height=30,
+button_radiation = Button(x=55, y=200, width=70, height=30,
                           label="γ", label_font=font_greek, fill_color=0xB9C92F)
-button_distance = Button(x=90, y=200, width=70, height=30,
-                         label="Prox", label_font=font_trek, fill_color=0xBF0F0F)
-button_uv = Button(x=163, y=200, width=70, height=30,
+button_uv = Button(x=152, y=200, width=70, height=30,
                    label="Δ", label_font=font_greek, fill_color=0xBF0F0F)
-button_probes = Button(x=236, y=200, width=70, height=30,
+button_probes = Button(x=242, y=200, width=70, height=30,
                        label="Probes", label_font=font_trek, fill_color=0xBF0F0F)
-buttons.extend([button_radiation, button_distance, button_uv, button_probes])
+buttons.extend([button_radiation, button_uv, button_probes])
 for b in buttons:
     normal_ui.append(b)
 
@@ -154,7 +138,7 @@ radiation_label.x = 70
 radiation_label.y = 80
 
 # Header for Radiation Tab
-top_left_label = Label(font=font_trek, text="GAMMA SCAN", color=0xFFFFFF, scale=1)
+top_left_label = Label(font=font_trek, text="GAMMA", color=0xFFFFFF, scale=1)
 top_left_label.x = 10   # Adjust x coordinate as needed
 top_left_label.y = 20   # Adjust y coordinate as needed
 view_radiation.append(top_left_label)
@@ -171,26 +155,8 @@ button_cal = Button(x=50, y=35, width=40, height=30,
                     label="C", label_font=font_trek, fill_color=0xBF0F0F)
 view_radiation.append(button_cal)
 
-# Distance Tab UI
-view_distance = displayio.Group()
-# Add a top left label for the Proximity tab
-top_left_label_distance = Label(font=font_trek, text="PROXIMITY", color=0xFFFFFF, scale=1)
-top_left_label_distance.x = 10   # Adjust x coordinate as desired
-top_left_label_distance.y = 20   # Adjust y coordinate as desired
-view_distance.append(top_left_label_distance)
-
-distance_label = Label(font=font_trek, text="Distance: -- m", color=0x00FFFF, scale=1)
-distance_label.x = 70
-distance_label.y = 80
-view_distance.append(distance_label)
-no_data_label = Label(font=font_trek, text="Sensor offline", color=0xFF0000, scale=1)
-no_data_label.x = 70
-no_data_label.y = 130
-view_distance.append(no_data_label)
-
 # UV Sensor Tab UI
 view_uv = displayio.Group()
-# Add a top left label for the UV tab
 top_left_label_uv = Label(font=font_trek, text="ULTRA VIOLET", color=0xFFFFFF, scale=1)
 top_left_label_uv.x = 10   # Adjust x coordinate as desired
 top_left_label_uv.y = 20   # Adjust y coordinate as desired
@@ -372,7 +338,6 @@ def calculate_uSvh():
 
 # --- Update Display ---
 def update_display():
-    # (Removed stardate update)
     if view_live == "Radiation":
         if sum(count_history) == 0:
             radiation_label.text = "CPM: --"
@@ -382,14 +347,6 @@ def update_display():
             radiation_label.text = f"CPM: {calculate_cpm():.1f}"
             dose_label.text = f"DOSE: {calculate_uSvh():.3f} µSv/h"
             sensor_warning_label.text = ""
-    elif view_live == "Distance":
-        try:
-            dist_mm = lidar.distance
-            distance_label.text = f"Distance: {dist_mm/100:.2f} m"
-            no_data_label.text  = ""
-        except Exception:
-            distance_label.text = "Distance: -- m"
-            no_data_label.text  = "Measurement error"
     elif view_live == "UV":
         if uv_sensor_found:
             uv_index_label.text = f"UV Index: {ltr.uvi:.2f}"
@@ -419,7 +376,7 @@ def switch_view(new_view):
     pyportal.play_file("/sounds/tab.wav")
     if content_group:
         content_group.pop()
-    for view in (view_radiation, view_distance, view_uv, view_probes):
+    for view in (view_radiation, view_uv, view_probes):
         try:
             view.remove(delta_logo)
         except Exception:
@@ -429,28 +386,18 @@ def switch_view(new_view):
         content_group.append(view_radiation)
         view_radiation.append(delta_logo)
         button_radiation.fill_color = 0xB9C92F
-        button_distance.fill_color = 0xBF0F0F
-        button_uv.fill_color = 0xBF0F0F
-        button_probes.fill_color = 0xBF0F0F
-    elif new_view == "Distance":
-        content_group.append(view_distance)
-        view_distance.append(delta_logo)
-        button_radiation.fill_color = 0xBF0F0F
-        button_distance.fill_color = 0xB9C92F
         button_uv.fill_color = 0xBF0F0F
         button_probes.fill_color = 0xBF0F0F
     elif new_view == "UV":
         content_group.append(view_uv)
         view_uv.append(delta_logo)
         button_radiation.fill_color = 0xBF0F0F
-        button_distance.fill_color = 0xBF0F0F
         button_uv.fill_color = 0xB9C92F
         button_probes.fill_color = 0xBF0F0F
     elif new_view == "Probes":
         content_group.append(view_probes)
         view_probes.append(delta_logo)
         button_radiation.fill_color = 0xBF0F0F
-        button_distance.fill_color = 0xBF0F0F
         button_uv.fill_color = 0xBF0F0F
         button_probes.fill_color = 0xB9C92F
     update_display()
@@ -517,7 +464,6 @@ content_group.append(view_radiation)
 
 # --- Main Loop ---
 while True:
-    # Process Calibration Window Input (if active)
     if calibration_active:
         touch = ts.touch_point
         if touch:
@@ -544,12 +490,11 @@ while True:
                 time.sleep(0.3)
         continue
 
-    # Process normal touch events for switching tabs or triggering calibration.
     touch = ts.touch_point
     if touch:
         for i, button in enumerate(buttons):
             if button.contains(touch):
-                switch_view(["Radiation", "Distance", "UV", "Probes"][i])
+                switch_view(["Radiation", "UV", "Probes"][i])
                 break
         # Calibrate button on Radiation Tab.
         if view_live == "Radiation" and button_cal.contains(touch):
@@ -568,7 +513,6 @@ while True:
                 connect_button.fill_color = 0x11709F
                 success = try_connect_wifi()
                 if success:
-                    # Removed time update (stardate not needed)
                     update_solar_wind()
                     last_solar_update = time.monotonic()
                     gc.collect()
